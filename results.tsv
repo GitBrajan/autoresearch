@@ -1,2 +1,3 @@
 commit	val_bpb	memory_gb	status	description
 c81803d	1.008821	16.0	keep	baseline (rank=16 lr=1e-4 layers=16 batch=4 accum=2 seq=2048)
+204f499	0.913991	14.2	keep	lr=5e-5 (halved from baseline)

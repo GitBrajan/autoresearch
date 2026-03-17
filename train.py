@@ -1,385 +1,92 @@
 """
-Autoresearch pretraining script. Single-device, single-file.
-Apple Silicon MLX port of karpathy/autoresearch.
-Usage: uv run train.py
+Autoresearch LoRA fine-tuning script for Qwen3-8B-4bit on Apple Silicon.
+Adapted from Karpathy's autoresearch to optimize LoRA hyperparameters.
+
+The autoresearch agent modifies ONLY the hyperparameters block below,
+then runs this script. Each experiment is time-budgeted to 5 minutes
+of training. The agent keeps improvements and reverts failures.
+
+Usage: ~/.venvs/mlx/bin/python train.py
 """
 
-import gc
 import math
 import os
 import time
-from dataclasses import dataclass
+import types
+from functools import partial
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
+from mlx_lm import load as load_model
+from mlx_lm.tuner.datasets import CacheDataset, load_local_dataset
+from mlx_lm.tuner.trainer import default_loss, evaluate, iterate_batches
+from mlx_lm.tuner.trainer import grad_checkpoint as apply_grad_checkpoint
+from mlx_lm.tuner.utils import linear_to_lora_layers
 
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-
-
-@dataclass
-class GPTConfig:
-    sequence_len: int = 2048
-    vocab_size: int = 32768
-    n_layer: int = 12
-    n_head: int = 6
-    n_kv_head: int = 6
-    n_embd: int = 768
-    window_pattern: str = "SSSL"
-
-
-def norm(x):
-    return x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + 1e-5)
-
-
-def has_ve(layer_idx, n_layer):
-    """Returns True if layer should have Value Embedding (alternating, last always included)."""
-    return layer_idx % 2 == (n_layer - 1) % 2
-
-
-def create_additive_causal_mask(seq_len, dtype=mx.float32):
-    indices = mx.arange(seq_len)
-    blocked = indices[None, :] > indices[:, None]
-    return mx.where(blocked, mx.array(float("-inf"), dtype=dtype), mx.array(0.0, dtype=dtype))
-
-
-def create_sliding_window_mask(seq_len, window_size, dtype=mx.float32):
-    indices = mx.arange(seq_len)
-    causal = indices[None, :] > indices[:, None]
-    too_far = (indices[:, None] - indices[None, :]) >= window_size
-    blocked = causal | too_far
-    return mx.where(blocked, mx.array(float("-inf"), dtype=dtype), mx.array(0.0, dtype=dtype))
-
-
-def get_peak_memory_mb():
-    return mx.get_peak_memory() / 1024 / 1024
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 32
-        self.ve_gate = (
-            nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False)
-            if has_ve(layer_idx, config.n_layer)
-            else None
-        )
-        self.rope = nn.RoPE(self.head_dim, traditional=True, base=10000)
-
-    def __call__(self, x, ve, mask):
-        batch_size, seq_len, _ = x.shape
-        q = self.c_q(x).reshape(batch_size, seq_len, self.n_head, self.head_dim)
-        k = self.c_k(x).reshape(batch_size, seq_len, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).reshape(batch_size, seq_len, self.n_kv_head, self.head_dim)
-
-        if ve is not None and self.ve_gate is not None:
-            ve = ve.reshape(batch_size, seq_len, self.n_kv_head, self.head_dim)
-            gate = 2 * mx.sigmoid(self.ve_gate(x[..., : self.ve_gate_channels]))
-            v = v + mx.expand_dims(gate, axis=-1) * ve
-
-        q = q.transpose(0, 2, 1, 3)
-        k = k.transpose(0, 2, 1, 3)
-        v = v.transpose(0, 2, 1, 3)
-
-        q = norm(self.rope(q))
-        k = norm(self.rope(k))
-
-        scale = 1.0 / math.sqrt(self.head_dim)
-        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
-        y = y.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
-        return self.c_proj(y)
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-
-    def __call__(self, x):
-        x = self.c_fc(x)
-        x = mx.maximum(x, 0) ** 2
-        return self.c_proj(x)
-
-
-class Block(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
-
-    def __call__(self, x, ve, mask):
-        x = x + self.attn(norm(x), ve, mask)
-        x = x + self.mlp(norm(x))
-        return x
-
-
-class GPT(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.window_sizes = self._compute_window_sizes(config)
-        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
-        self.blocks = [Block(config, i) for i in range(config.n_layer)]
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.resid_lambdas = mx.ones((config.n_layer,), dtype=mx.float32)
-        self.x0_lambdas = mx.zeros((config.n_layer,), dtype=mx.float32)
-        head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = {
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
-            for i in range(config.n_layer)
-            if has_ve(i, config.n_layer)
-        }
-        self._mask_cache = {}
-
-    def init_weights(self):
-        n_embd = self.config.n_embd
-        scale = 3**0.5 * n_embd**-0.5
-
-        self.wte.weight = (mx.random.normal(self.wte.weight.shape) * 1.0).astype(mx.bfloat16)
-        self.lm_head.weight = (mx.random.normal(self.lm_head.weight.shape) * 0.001).astype(mx.bfloat16)
-
-        for block in self.blocks:
-            block.attn.c_q.weight = mx.random.uniform(-scale, scale, block.attn.c_q.weight.shape).astype(mx.bfloat16)
-            block.attn.c_k.weight = mx.random.uniform(-scale, scale, block.attn.c_k.weight.shape).astype(mx.bfloat16)
-            block.attn.c_v.weight = mx.random.uniform(-scale, scale, block.attn.c_v.weight.shape).astype(mx.bfloat16)
-            block.attn.c_proj.weight = mx.zeros_like(block.attn.c_proj.weight).astype(mx.bfloat16)
-            block.mlp.c_fc.weight = mx.random.uniform(-scale, scale, block.mlp.c_fc.weight.shape).astype(mx.bfloat16)
-            block.mlp.c_proj.weight = mx.zeros_like(block.mlp.c_proj.weight).astype(mx.bfloat16)
-            if block.attn.ve_gate is not None:
-                block.attn.ve_gate.weight = mx.zeros_like(block.attn.ve_gate.weight).astype(mx.bfloat16)
-
-        self.resid_lambdas = mx.ones((self.config.n_layer,), dtype=mx.float32)
-        self.x0_lambdas = mx.full((self.config.n_layer,), 0.1, dtype=mx.float32)
-
-        for ve in self.value_embeds.values():
-            ve.weight = mx.random.uniform(-scale, scale, ve.weight.shape).astype(mx.bfloat16)
-
-    def _compute_window_sizes(self, config):
-        pattern = config.window_pattern.upper()
-        assert all(char in "SL" for char in pattern)
-        long_window = config.sequence_len
-        short_window = long_window // 2
-        char_to_window = {"L": long_window, "S": short_window}
-        window_sizes = []
-        for layer_idx in range(config.n_layer):
-            char = pattern[layer_idx % len(pattern)]
-            window_sizes.append(char_to_window[char])
-        window_sizes[-1] = long_window
-        return window_sizes
-
-    def _get_masks(self, seq_len):
-        unique_windows = set(self.window_sizes)
-        for window_size in unique_windows:
-            key = (seq_len, window_size)
-            if key not in self._mask_cache:
-                if window_size >= seq_len:
-                    self._mask_cache[key] = create_additive_causal_mask(seq_len)
-                else:
-                    self._mask_cache[key] = create_sliding_window_mask(seq_len, window_size)
-        return [self._mask_cache[(seq_len, window_size)] for window_size in self.window_sizes]
-
-    def __call__(self, idx, targets=None, reduction="mean"):
-        _, seq_len = idx.shape
-        masks = self._get_masks(seq_len)
-
-        x = self.wte(idx)
-        x = norm(x)
-        x0 = x
-        for i, block in enumerate(self.blocks):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, masks[i])
-        x = norm(x)
-
-        logits = self.lm_head(x).astype(mx.float32)
-        logits = 15.0 * mx.tanh(logits / 15.0)
-
-        if targets is None:
-            return logits
-
-        valid = targets != -1
-        targets_safe = mx.where(valid, targets, mx.zeros_like(targets))
-        ce = nn.losses.cross_entropy(logits, targets_safe, reduction="none")
-        ce = ce * valid
-        if reduction == "none":
-            return ce
-        denom = mx.maximum(mx.sum(valid), 1)
-        return mx.sum(ce) / denom
-
-
-class AdamW:
-    def __init__(self, model, unembedding_lr, embedding_lr, matrix_lr, weight_decay, adam_betas, scalar_lr):
-        self.param_config = {}
-        self.adam_state = {}
-
-        model_dim = model.config.n_embd
-        dmodel_lr_scale = (model_dim / 768) ** -0.5
-
-        flat_params = tree_flatten(model.parameters())
-        for path, param in flat_params:
-            if "blocks" in path and param.ndim == 2:
-                self.param_config[path] = {
-                    "lr": matrix_lr,
-                    "betas": adam_betas,
-                    "eps": 1e-10,
-                    "weight_decay": weight_decay,
-                }
-            elif "wte" in path:
-                self.param_config[path] = {
-                    "lr": embedding_lr * dmodel_lr_scale,
-                    "betas": adam_betas,
-                    "eps": 1e-10,
-                    "weight_decay": 0.0,
-                }
-            elif "value_embeds" in path:
-                self.param_config[path] = {
-                    "lr": embedding_lr * dmodel_lr_scale,
-                    "betas": adam_betas,
-                    "eps": 1e-10,
-                    "weight_decay": 0.0,
-                }
-            elif "lm_head" in path:
-                self.param_config[path] = {
-                    "lr": unembedding_lr * dmodel_lr_scale,
-                    "betas": adam_betas,
-                    "eps": 1e-10,
-                    "weight_decay": 0.0,
-                }
-            elif "resid_lambdas" in path:
-                self.param_config[path] = {
-                    "lr": scalar_lr * 0.01,
-                    "betas": adam_betas,
-                    "eps": 1e-10,
-                    "weight_decay": 0.0,
-                }
-            elif "x0_lambdas" in path:
-                self.param_config[path] = {
-                    "lr": scalar_lr,
-                    "betas": (0.96, 0.95),
-                    "eps": 1e-10,
-                    "weight_decay": 0.0,
-                }
-            else:
-                self.param_config[path] = {
-                    "lr": unembedding_lr * dmodel_lr_scale,
-                    "betas": adam_betas,
-                    "eps": 1e-10,
-                    "weight_decay": 0.0,
-                }
-
-        self.initial_lrs = {path: config["lr"] for path, config in self.param_config.items()}
-
-    def _set_path_value(self, model, path, value):
-        parts = path.split(".")
-        obj = model
-        for part in parts[:-1]:
-            if isinstance(obj, list):
-                obj = obj[int(part)]
-            elif isinstance(obj, dict):
-                obj = obj[part]
-            else:
-                obj = getattr(obj, part)
-        last = parts[-1]
-        if isinstance(obj, dict):
-            obj[last] = value
-        else:
-            setattr(obj, last, value)
-
-    def _step(self, path, grad, param, config):
-        grad_f32 = grad.astype(mx.float32)
-        param_f32 = param.astype(mx.float32)
-        lr = config["lr"]
-        beta1, beta2 = config["betas"]
-        eps = config["eps"]
-        weight_decay = config["weight_decay"]
-
-        if path not in self.adam_state:
-            self.adam_state[path] = {
-                "m": mx.zeros_like(grad_f32),
-                "v": mx.zeros_like(grad_f32),
-                "t": 0,
-            }
-
-        state = self.adam_state[path]
-        state["t"] += 1
-        state["m"] = beta1 * state["m"] + (1 - beta1) * grad_f32
-        state["v"] = beta2 * state["v"] + (1 - beta2) * (grad_f32 * grad_f32)
-
-        bias1 = 1 - beta1 ** state["t"]
-        bias2 = 1 - beta2 ** state["t"]
-        denom = mx.sqrt(state["v"] / bias2) + eps
-        step_size = lr / bias1
-
-        param_f32 = param_f32 * (1 - lr * weight_decay)
-        param_f32 = param_f32 - step_size * (state["m"] / denom)
-        return param_f32.astype(param.dtype)
-
-    def update(self, model, grads):
-        flat_grads = dict(tree_flatten(grads))
-        flat_params = dict(tree_flatten(model.parameters()))
-        for path, grad in flat_grads.items():
-            if path not in self.param_config:
-                continue
-            config = self.param_config[path]
-            param = flat_params[path]
-            new_param = self._step(path, grad, param, config)
-            self._set_path_value(model, path, new_param)
-
-    def set_lr_multiplier(self, multiplier):
-        for path, config in self.param_config.items():
-            config["lr"] = self.initial_lrs[path] * multiplier
-
-    @property
-    def state(self):
-        arrays = []
-        for state in self.adam_state.values():
-            arrays.extend([state["m"], state["v"]])
-        return arrays
-
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 # ---------------------------------------------------------------------------
-# Hyperparameters (edit these directly, no CLI flags needed)
+# Hyperparameters (edit these directly — this is what autoresearch tunes)
 # ---------------------------------------------------------------------------
 
-# Model architecture
-ASPECT_RATIO = 64
-HEAD_DIM = 128
-WINDOW_PATTERN = "SSSL"
+# LoRA configuration
+LORA_RANK = 16
+LORA_SCALE = 20.0
+LORA_DROPOUT = 0.05
+NUM_LORA_LAYERS = 16  # how many layers from the end get LoRA; -1 = all
+LORA_KEYS = [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+]
 
-# v0.1: AdamW only. Muon port is future work.
-TOTAL_BATCH_SIZE = 2**16
-EMBEDDING_LR = 0.6
-UNEMBEDDING_LR = 0.004
-MATRIX_LR = 0.04
-SCALAR_LR = 0.5
-WEIGHT_DECAY = 0.2
-ADAM_BETAS = (0.8, 0.95)
-WARMUP_RATIO = 0.0
-WARMDOWN_RATIO = 0.5
-FINAL_LR_FRAC = 0.0
+# Training
+LEARNING_RATE = 1e-4
+BATCH_SIZE = 4
+GRAD_ACCUM_STEPS = 2  # effective batch = BATCH_SIZE * GRAD_ACCUM_STEPS
+MAX_SEQ_LENGTH = 2048
+MASK_PROMPT = True
+GRAD_CHECKPOINT = True
 
-# Model size
-DEPTH = 4
-DEVICE_BATCH_SIZE = 16
-FINAL_EVAL_BATCH_SIZE = 256
-STARTUP_EXCLUDE_STEPS = 1
+# Optimizer: "adam", "adamw", or "adafactor"
+OPTIMIZER = "adam"
+WEIGHT_DECAY = 0.0  # only used with adamw
+
+# LR schedule
+WARMUP_RATIO = 0.0  # fraction of budget spent warming up
+WARMDOWN_RATIO = 0.3  # fraction of budget spent cooling down
+FINAL_LR_FRAC = 0.1  # LR at end of warmdown, as fraction of peak
+
+# Eval
+VAL_BATCHES = 25
+
+# ---------------------------------------------------------------------------
+# Constants (fixed — do not modify)
+# ---------------------------------------------------------------------------
+MODEL_PATH = (
+    "/Users/develo/.cache/huggingface/hub/models--mlx-community--Qwen3-8B-4bit"
+    "/snapshots/545dc4251c05440727734bcd94334791f6ab0192"
+)
+DATA_DIR = "/Users/develo/Projects/ailab1/data"
+TIME_BUDGET = 300  # 5 minutes training (wall clock, excludes startup/eval)
+SEED = 42
+STARTUP_EXCLUDE_STEPS = 1  # exclude first N steps from time budget (compilation)
+
+# ---------------------------------------------------------------------------
+# LR schedule helper
+# ---------------------------------------------------------------------------
 
 
 def get_lr_multiplier(progress):
+    """Warmup → constant → warmdown schedule."""
     if progress < WARMUP_RATIO:
         return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
     if progress < 1.0 - WARMDOWN_RATIO:
@@ -388,113 +95,159 @@ def get_lr_multiplier(progress):
     return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 t_start = time.time()
-mx.random.seed(42)
+mx.random.seed(SEED)
 
-tokenizer = Tokenizer.from_directory()
-vocab_size = tokenizer.get_vocab_size()
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)
+# 1. Load model and tokenizer
+print("Loading model...")
+model, tokenizer = load_model(MODEL_PATH, tokenizer_config={"trust_remote_code": True})
+t_loaded = time.time()
+print(f"Model loaded in {t_loaded - t_start:.1f}s")
+
+# 2. Freeze base model, inject LoRA layers
+model.freeze()
+lora_config = {
+    "rank": LORA_RANK,
+    "scale": LORA_SCALE,
+    "dropout": LORA_DROPOUT,
+    "keys": LORA_KEYS,
+}
+linear_to_lora_layers(model, NUM_LORA_LAYERS, lora_config)
+
+trainable_params = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
+total_params = sum(p.size for _, p in tree_flatten(model.parameters()))
+print(
+    f"Trainable parameters: {trainable_params / total_params:.3%} "
+    f"({trainable_params / 1e6:.3f}M / {total_params / 1e6:.3f}M)"
+)
+
+# 3. Load datasets
+data_config = types.SimpleNamespace(
+    mask_prompt=MASK_PROMPT,
+    prompt_feature="prompt",
+    completion_feature="completion",
+    text_feature="text",
+    chat_feature="messages",
+)
+train_raw, valid_raw, _ = load_local_dataset(Path(DATA_DIR), tokenizer, data_config)
+train_set = CacheDataset(train_raw)
+valid_set = CacheDataset(valid_raw)
+print(f"Train: {len(train_set)} examples, Valid: {len(valid_set)} examples")
+
+# 4. Set up optimizer
+if OPTIMIZER == "adam":
+    opt = optim.Adam(learning_rate=LEARNING_RATE)
+elif OPTIMIZER == "adamw":
+    opt = optim.AdamW(learning_rate=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+elif OPTIMIZER == "adafactor":
+    opt = optim.Adafactor(learning_rate=LEARNING_RATE)
+else:
+    raise ValueError(f"Unknown optimizer: {OPTIMIZER}")
+
+# 5. Apply gradient checkpointing
+if GRAD_CHECKPOINT and hasattr(model, "layers") and len(model.layers) > 0:
+    apply_grad_checkpoint(model.layers[0])
+
+# 6. Compile the training step
+loss_value_and_grad = nn.value_and_grad(model, default_loss)
+
+state = [model.state, opt.state, mx.random.state]
+
+
+@partial(mx.compile, inputs=state, outputs=state)
+def compiled_step(batch, lengths):
+    (loss, ntoks), grads = loss_value_and_grad(model, batch, lengths)
+    grads, _ = optim.clip_grad_norm(grads, max_norm=1.0)
+    opt.update(model, grads)
+    return loss, ntoks
+
+
+# 7. Training loop (time-budgeted)
+model.train()
+batch_iter = iterate_batches(
+    dataset=train_set,
+    batch_size=BATCH_SIZE,
+    max_seq_length=MAX_SEQ_LENGTH,
+    loop=True,
+)
+
 t_data = time.time()
-print(f"Data/tokenizer loaded in {t_data - t_start:.1f}s")
+print(f"Setup complete in {t_data - t_start:.1f}s, starting training...")
+print(f"Time budget: {TIME_BUDGET}s | Grad accum: {GRAD_ACCUM_STEPS}")
 
-model_dim = ((DEPTH * ASPECT_RATIO + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-config = GPTConfig(
-    sequence_len=MAX_SEQ_LEN,
-    vocab_size=vocab_size,
-    n_layer=DEPTH,
-    n_head=model_dim // HEAD_DIM,
-    n_kv_head=model_dim // HEAD_DIM,
-    n_embd=model_dim,
-    window_pattern=WINDOW_PATTERN,
-)
-
-model = GPT(config)
-model.init_weights()
-mx.eval(model.parameters())
-num_params = sum(param.size for _, param in tree_flatten(model.parameters()))
-
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-
-optimizer = AdamW(
-    model,
-    unembedding_lr=UNEMBEDDING_LR,
-    embedding_lr=EMBEDDING_LR,
-    matrix_lr=MATRIX_LR,
-    weight_decay=WEIGHT_DECAY,
-    adam_betas=ADAM_BETAS,
-    scalar_lr=SCALAR_LR,
-)
-
-loss_grad_fn = nn.value_and_grad(model, lambda model, inputs, targets: model(inputs, targets=targets))
-
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
-
-smooth_train_loss = 0.0
 total_training_time = 0.0
 step = 0
+total_tokens = 0
+smooth_loss = 0.0
 t_compiled = None
 
 while True:
     t0 = time.time()
-    accum_grads = None
-    train_loss = None
 
-    for _ in range(grad_accum_steps):
-        loss, grads = loss_grad_fn(model, x, y)
-        mx.eval(loss, grads)
-        if t_compiled is None:
-            t_compiled = time.time()
-            print(f"Model compiled in {t_compiled - t_data:.1f}s")
-        train_loss = loss
-        if accum_grads is None:
-            accum_grads = grads
+    # Gradient accumulation
+    accum_loss = 0.0
+    accum_ntoks = 0
+
+    for micro in range(GRAD_ACCUM_STEPS):
+        batch, lengths = next(batch_iter)
+
+        if GRAD_ACCUM_STEPS == 1:
+            # Single step — use compiled version
+            loss, ntoks = compiled_step(batch, lengths)
+            mx.eval(state)
         else:
-            accum_grads = tree_map(lambda lhs, rhs: lhs + rhs, accum_grads, grads)
-        x, y, epoch = next(train_loader)
+            # Manual accumulation — can't use mx.compile easily
+            (loss, ntoks), grads = loss_value_and_grad(model, batch, lengths)
+            mx.eval(loss, ntoks, grads)
+            if micro == 0:
+                accum_grads = grads
+            else:
+                accum_grads = tree_map(lambda a, b: a + b, accum_grads, grads)
 
-    if grad_accum_steps > 1:
-        accum_grads = tree_map(lambda grad: grad * (1.0 / grad_accum_steps), accum_grads)
+        accum_loss += loss.item() * ntoks.item()
+        accum_ntoks += ntoks.item()
 
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lrm = get_lr_multiplier(progress)
-    optimizer.set_lr_multiplier(lrm)
-    optimizer.update(model, accum_grads)
-    mx.eval(model.parameters(), *optimizer.state)
+    if GRAD_ACCUM_STEPS > 1:
+        # Average gradients and apply
+        accum_grads = tree_map(lambda g: g * (1.0 / GRAD_ACCUM_STEPS), accum_grads)
+        opt.update(model, accum_grads)
+        mx.eval(model.parameters(), opt.state)
 
-    train_loss_f = float(train_loss.item())
-    if train_loss_f > 100:
-        print("FAIL")
-        raise SystemExit(1)
+    if t_compiled is None:
+        t_compiled = time.time()
+        print(f"First step compiled in {t_compiled - t_data:.1f}s")
 
     dt = time.time() - t0
     if step >= STARTUP_EXCLUDE_STEPS:
         total_training_time += dt
 
+    step_loss = accum_loss / max(accum_ntoks, 1)
+    total_tokens += accum_ntoks
+
     ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
+    smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * step_loss
+    debiased_loss = smooth_loss / (1 - ema_beta ** (step + 1))
+
+    # LR schedule
+    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    lrm = get_lr_multiplier(progress)
+    opt.learning_rate = LEARNING_RATE * lrm
+
     pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt) if dt > 0 else 0
     remaining = max(0.0, TIME_BUDGET - total_training_time)
+    tok_per_sec = int(accum_ntoks / dt) if dt > 0 else 0
 
     print(
-        f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
-        f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
-        f"epoch: {epoch} | remaining: {remaining:.0f}s    ",
+        f"\rstep {step:04d} ({pct_done:.1f}%) | loss: {debiased_loss:.4f} | "
+        f"lr: {LEARNING_RATE * lrm:.2e} | dt: {dt * 1000:.0f}ms | "
+        f"tok/s: {tok_per_sec:,} | remaining: {remaining:.0f}s    ",
         end="",
         flush=True,
     )
-
-    if step == 0:
-        gc.collect()
-        gc.freeze()
-        gc.disable()
-    elif (step + 1) % 5000 == 0:
-        gc.collect()
 
     step += 1
     if step >= STARTUP_EXCLUDE_STEPS and total_training_time >= TIME_BUDGET:
@@ -502,25 +255,34 @@ while True:
 
 print()
 t_train = time.time()
-print(f"Training completed in {t_train - t_compiled:.1f}s")
+print(f"Training completed: {step} steps in {t_train - t_compiled:.1f}s")
 
-total_tokens = step * TOTAL_BATCH_SIZE
+# 8. Final evaluation
 print("Starting final eval...")
-print(f"Final eval batch size: {FINAL_EVAL_BATCH_SIZE}")
-val_bpb = evaluate_bpb(model, tokenizer, FINAL_EVAL_BATCH_SIZE)
+model.eval()
+val_loss = evaluate(
+    model=model,
+    dataset=valid_set,
+    batch_size=BATCH_SIZE,
+    num_batches=VAL_BATCHES,
+    max_seq_length=MAX_SEQ_LENGTH,
+    loss=default_loss,
+    iterate_batches=iterate_batches,
+)
 t_eval = time.time()
 print(f"Final eval completed in {t_eval - t_train:.1f}s")
 
-steady_state_mfu = 0.0
-peak_vram_mb = get_peak_memory_mb()
+# 9. Output in autoresearch format
+val_bpb = val_loss / math.log(2)  # nats-per-token → bits-per-token
+peak_vram_mb = mx.get_peak_memory() / 1024 / 1024
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_eval - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
+print(f"mfu_percent:      0.00")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+print(f"num_params_M:     {trainable_params / 1e6:.1f}")
+print(f"lora_rank:        {LORA_RANK}")

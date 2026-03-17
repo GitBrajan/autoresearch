@@ -37,7 +37,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 LORA_RANK = 8
 LORA_SCALE = 16.0
 LORA_DROPOUT = 0.05
-NUM_LORA_LAYERS = 16  # how many layers from the end get LoRA; -1 = all
+NUM_LORA_LAYERS = -1  # how many layers from the end get LoRA; -1 = all
 LORA_KEYS = [
     "self_attn.q_proj",
     "self_attn.k_proj",

@@ -3,3 +3,4 @@ c81803d	1.008821	16.0	keep	baseline (rank=16 lr=1e-4 layers=16 batch=4 accum=2 s
 204f499	0.913991	14.2	keep	lr=5e-5 (halved from baseline)
 8aa69a3	1.033607	10.6	discard	seq_len=1024 (worse despite more steps)
 9441598	0.852134	10.9	keep	rank=8 scale=16 (smaller adapter wins)
+f3dd6d4	0.747267	11.8	keep	all layers (-1) instead of 16

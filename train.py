@@ -34,8 +34,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 # ---------------------------------------------------------------------------
 
 # LoRA configuration
-LORA_RANK = 16
-LORA_SCALE = 20.0
+LORA_RANK = 8
+LORA_SCALE = 16.0
 LORA_DROPOUT = 0.05
 NUM_LORA_LAYERS = 16  # how many layers from the end get LoRA; -1 = all
 LORA_KEYS = [

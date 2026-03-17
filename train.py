@@ -57,8 +57,8 @@ MASK_PROMPT = True
 GRAD_CHECKPOINT = True
 
 # Optimizer: "adam", "adamw", or "adafactor"
-OPTIMIZER = "adam"
-WEIGHT_DECAY = 0.0  # only used with adamw
+OPTIMIZER = "adamw"
+WEIGHT_DECAY = 0.01  # only used with adamw
 
 # LR schedule
 WARMUP_RATIO = 0.0  # fraction of budget spent warming up

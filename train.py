@@ -9,8 +9,10 @@ of training. The agent keeps improvements and reverts failures.
 Usage: ~/.venvs/mlx/bin/python train.py
 """
 
+import json
 import math
 import os
+import sys
 import time
 import types
 from functools import partial
@@ -67,6 +69,33 @@ FINAL_LR_FRAC = 0.1  # LR at end of warmdown, as fraction of peak
 
 # Eval
 VAL_BATCHES = 25
+
+# ---------------------------------------------------------------------------
+# Config override (used by run_search.py orchestrator)
+# ---------------------------------------------------------------------------
+if "--config" in sys.argv:
+    _cfg_idx = sys.argv.index("--config")
+    with open(sys.argv[_cfg_idx + 1]) as _f:
+        _cfg = json.load(_f)
+    LORA_RANK = _cfg.get("lora_rank", LORA_RANK)
+    LORA_SCALE = _cfg.get("lora_scale", LORA_SCALE)
+    LORA_DROPOUT = _cfg.get("lora_dropout", LORA_DROPOUT)
+    NUM_LORA_LAYERS = _cfg.get("num_lora_layers", NUM_LORA_LAYERS)
+    if "lora_keys" in _cfg and isinstance(_cfg["lora_keys"], list):
+        LORA_KEYS = _cfg["lora_keys"]
+    LEARNING_RATE = _cfg.get("learning_rate", LEARNING_RATE)
+    BATCH_SIZE = _cfg.get("batch_size", BATCH_SIZE)
+    GRAD_ACCUM_STEPS = _cfg.get("grad_accum_steps", GRAD_ACCUM_STEPS)
+    MAX_SEQ_LENGTH = _cfg.get("max_seq_length", MAX_SEQ_LENGTH)
+    MASK_PROMPT = _cfg.get("mask_prompt", MASK_PROMPT)
+    GRAD_CHECKPOINT = _cfg.get("grad_checkpoint", GRAD_CHECKPOINT)
+    OPTIMIZER = _cfg.get("optimizer", OPTIMIZER)
+    WEIGHT_DECAY = _cfg.get("weight_decay", WEIGHT_DECAY)
+    WARMUP_RATIO = _cfg.get("warmup_ratio", WARMUP_RATIO)
+    WARMDOWN_RATIO = _cfg.get("warmdown_ratio", WARMDOWN_RATIO)
+    FINAL_LR_FRAC = _cfg.get("final_lr_frac", FINAL_LR_FRAC)
+    VAL_BATCHES = _cfg.get("val_batches", VAL_BATCHES)
+    del _cfg, _f, _cfg_idx
 
 # ---------------------------------------------------------------------------
 # Constants (fixed — do not modify)

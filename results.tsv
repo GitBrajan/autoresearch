@@ -4,3 +4,6 @@ c81803d	1.008821	16.0	keep	baseline (rank=16 lr=1e-4 layers=16 batch=4 accum=2 s
 8aa69a3	1.033607	10.6	discard	seq_len=1024 (worse despite more steps)
 9441598	0.852134	10.9	keep	rank=8 scale=16 (smaller adapter wins)
 f3dd6d4	0.747267	11.8	keep	all layers (-1) instead of 16
+223724	1.076738	11.2	discard	Revert LR to baseline (1e-4) which often provides better convergence speed while keeping rank=8 and scale=2.0 for optimal signal-to-noise ratio; batch/accum unchanged to maintain effective batch size.
+224510	1.055002	17.4	discard	Reduce LR further to 2.5e-5 and scale to 2.0 to maintain signal-to-noise ratio with the optimal rank=8 configuration found in previous experiments; this should improve convergence stability and val_bpb.
+225307	0.961100	14.0	discard	Reduce LR further to stabilize convergence on the rank=8 adapter (which showed best val_bpb), lower scale to 2.0 to prevent overfitting given the short training time, and increase dropout to 0.1 for stronger regularization against the small effective batch size.

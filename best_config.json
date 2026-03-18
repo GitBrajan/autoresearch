@@ -1,0 +1,18 @@
+{
+  "lora_rank": 8,
+  "lora_scale": 16.0,
+  "lora_dropout": 0.05,
+  "num_lora_layers": -1,
+  "lora_keys": "attention+mlp",
+  "learning_rate": 5e-05,
+  "batch_size": 4,
+  "grad_accum_steps": 2,
+  "max_seq_length": 2048,
+  "optimizer": "adamw",
+  "weight_decay": 0.01,
+  "warmup_ratio": 0.0,
+  "warmdown_ratio": 0.3,
+  "final_lr_frac": 0.1,
+  "mask_prompt": true,
+  "grad_checkpoint": true
+}
